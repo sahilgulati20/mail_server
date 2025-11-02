@@ -56,8 +56,24 @@ const createTransporter = (service, user, pass, host, port) => {
   const isGmail = service && service.toLowerCase().includes("gmail");
   const hasExplicitHost = !!host && !!port;
 
-  // Short‑term fix for Gmail on Render: force 465 + secure + timeout
+  // Gmail via OAuth2 (preferred). If OAuth2 env vars exist, use them.
   if (!hasExplicitHost && isGmail) {
+    const { GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN } = process.env;
+    if (GMAIL_CLIENT_ID && GMAIL_CLIENT_SECRET && GMAIL_REFRESH_TOKEN) {
+      return nodemailer.createTransport({
+        service: "gmail",
+        auth: {
+          type: "OAuth2",
+          user,
+          clientId: GMAIL_CLIENT_ID,
+          clientSecret: GMAIL_CLIENT_SECRET,
+          refreshToken: GMAIL_REFRESH_TOKEN,
+        },
+        connectionTimeout: 10000,
+        pool: true,
+      });
+    }
+    // Fallback to SMTP (App Password) if OAuth2 not configured
     return nodemailer.createTransport({
       host: "smtp.gmail.com",
       port: 465,
