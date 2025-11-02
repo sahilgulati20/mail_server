@@ -1,12 +1,3 @@
-// Merged server combining functionality from server.js and mail_sender.js
-// Routes included:
-// - POST /generate-email    -> AI-powered HTML email generation (Gemini)
-// - POST /send-mails        -> CSV upload and basic bulk send with personalization
-// - POST /send-csv          -> CSV + optional logo/banner (URL or uploaded inline) bulk send
-// - POST /send-otp          -> Send OTP to email
-// - POST /verify-otp        -> Verify OTP
-// - GET  /                  -> Health check
-
 import express from "express";
 import bodyParser from "body-parser";
 import cors from "cors";
@@ -15,7 +6,6 @@ import dotenv from "dotenv";
 import multer from "multer";
 import csvParser from "csv-parser";
 import fs from "fs";
-import path from "path";
 import nodemailer from "nodemailer";
 import { initializeApp } from "firebase/app";
 import { getFirestore, collection, addDoc, serverTimestamp } from "firebase/firestore";
@@ -44,44 +34,14 @@ try {
   console.warn("Firebase init failed or already initialized:", err.message || err);
 }
 
-// ---------------- NODEMAILER SETUP (separate senders for OTP vs bulk) ----------------
-// You can configure two different accounts. Fallback to EMAIL_USER/EMAIL_PASS if specific ones are not set.
-const BULK_EMAIL_USER = process.env.BULK_EMAIL_USER || process.env.EMAIL_USER;
-const BULK_EMAIL_PASS = process.env.BULK_EMAIL_PASS || process.env.EMAIL_PASS;
-const BULK_EMAIL_SERVICE = process.env.BULK_EMAIL_SERVICE || process.env.EMAIL_SERVICE || "gmail";
-
-const OTP_EMAIL_USER = process.env.OTP_EMAIL_USER || process.env.EMAIL_USER;
-const OTP_EMAIL_PASS = process.env.OTP_EMAIL_PASS || process.env.EMAIL_PASS;
-const OTP_EMAIL_SERVICE = process.env.OTP_EMAIL_SERVICE || process.env.EMAIL_SERVICE || "gmail";
-
-if (!BULK_EMAIL_USER || !BULK_EMAIL_PASS) {
-  console.warn("Bulk sender credentials (BULK_EMAIL_USER/BULK_EMAIL_PASS) not fully set. Falling back to EMAIL_USER/EMAIL_PASS if available.");
-}
-if (!OTP_EMAIL_USER || !OTP_EMAIL_PASS) {
-  console.warn("OTP sender credentials (OTP_EMAIL_USER/OTP_EMAIL_PASS) not fully set. Falling back to EMAIL_USER/EMAIL_PASS if available.");
-}
-
-const bulkTransporter = nodemailer.createTransport({
-  service: BULK_EMAIL_SERVICE,
+// ---------------- NODEMAILER SETUP ----------------
+const transporter = nodemailer.createTransport({
+  service: "gmail",
   auth: {
-    user: BULK_EMAIL_USER,
-    pass: BULK_EMAIL_PASS,
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS,
   },
 });
-
-const otpTransporter = nodemailer.createTransport({
-  service: OTP_EMAIL_SERVICE,
-  auth: {
-    user: OTP_EMAIL_USER,
-    pass: OTP_EMAIL_PASS,
-  },
-});
-
-console.log(`📧 Bulk sender: ${BULK_EMAIL_USER || "<unset>"} via ${BULK_EMAIL_SERVICE}`);
-console.log(`🔐 OTP sender:  ${OTP_EMAIL_USER || "<unset>"} via ${OTP_EMAIL_SERVICE}`);
-
-// ---------------- MULTER ----------------
-const upload = multer({ dest: "uploads/" });
 
 // ---------------- OTP STORE ----------------
 const otpStore = {};
@@ -298,9 +258,7 @@ async function fetchWithBackoff(url, payload, maxRetries = 5) {
   throw new Error("Failed after max retries");
 }
 
-// =======================================================
-// 🤖 AI email generation endpoint (from server.js)
-// =======================================================
+// --- GEMINI / AI email generation endpoint setup (from server.js) ---
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash-preview-09-2025";
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
@@ -380,9 +338,10 @@ Your response MUST start *exactly* with \`<!DOCTYPE html>\` and contain ONLY the
 });
 
 // =======================================================
-// 📤 Basic CSV bulk mail sender (from server.js)
-// Expects field name csvFile; body: subject, html
+// 🚀 MAIL SENDER / CSV + MULTER HANDLER (from server.js)
 // =======================================================
+const upload = multer({ dest: "uploads/" });
+
 app.post("/send-mails", upload.single("csvFile"), async (req, res) => {
   try {
     const csvFilePath = req.file.path;
@@ -406,12 +365,13 @@ app.post("/send-mails", upload.single("csvFile"), async (req, res) => {
           const personalizedHtml = html.replace(/\[Name\]/g, name);
 
           try {
-            await bulkTransporter.sendMail({
-              from: `"Mail Buddy" <${BULK_EMAIL_USER}>`,
+            await transporter.sendMail({
+              from: `"Mail Buddy" <${process.env.EMAIL_USER}>`,
               to: email,
               subject,
               html: personalizedHtml,
             });
+            console.log(`✅ Sent to ${email}`);
 
             // store record in Firestore if available
             if (db) {
@@ -438,227 +398,7 @@ app.post("/send-mails", upload.single("csvFile"), async (req, res) => {
   }
 });
 
-// =======================================================
-// 📦 Advanced CSV sender with logo/banner inline attachments (from mail_sender.js)
-// Fields: csvFile [required], logoFile [optional], bannerFile [optional]
-// Body: subject, html, logoUrl, bannerUrl, delayMs, fromName
-// =======================================================
-app.post(
-  "/send-csv",
-  upload.fields([
-    { name: "csvFile", maxCount: 1 },
-    { name: "logoFile", maxCount: 1 },
-    { name: "bannerFile", maxCount: 1 },
-    // Accept arbitrary file attachments from the frontend UI
-    { name: "attachments", maxCount: 20 },
-  ]),
-  async (req, res) => {
-    try {
-      // --- Validate input ---
-      if (!req.files?.csvFile) {
-        return res.status(400).json({ error: "CSV file is required." });
-      }
-      const subject = req.body.subject;
-      const html = req.body.html;
-      const logoUrlRaw = (req.body.logoUrl || "").trim();
-      const bannerUrlRaw = (req.body.bannerUrl || "").trim();
-      const delayMs = parseInt(req.body.delayMs || "300", 10);
-      const fromName = req.body.fromName || "Team Intellia";
-
-      if (!subject || !html) {
-        fs.unlinkSync(req.files.csvFile[0].path);
-        return res.status(400).json({ error: "Missing subject or HTML body." });
-      }
-
-      // --- Parse CSV ---
-      const recipients = [];
-      await new Promise((resolve, reject) => {
-        fs.createReadStream(req.files.csvFile[0].path)
-          .pipe(csvParser())
-          .on("data", (row) => recipients.push(row))
-          .on("end", resolve)
-          .on("error", reject);
-      });
-
-      if (recipients.length === 0) {
-        fs.unlinkSync(req.files.csvFile[0].path);
-        return res.status(400).json({ error: "No recipients found in CSV." });
-      }
-
-      // --- Prepare image attachments (embed as inline, not external paths) ---
-      const attachments = [];
-      const logoCid = `logo-${Date.now()}`;
-      const bannerCid = `banner-${Date.now()}`;
-
-      // Normalize commonly shared links (e.g., Google Drive) to a direct-view URL
-      const normalizeImageUrl = (url) => {
-        try {
-          const u = new URL(url);
-          const isDrive = u.hostname.includes("drive.google.com");
-          if (isDrive) {
-            // Patterns:
-            // - /file/d/<id>/view?usp=sharing
-            // - /open?id=<id>
-            // - /uc?export=download&id=<id>
-            let id = null;
-            const m = u.pathname.match(/\/d\/([^/]+)/);
-            if (m && m[1]) id = m[1];
-            if (!id) id = u.searchParams.get("id");
-            if (id) {
-              return `https://drive.google.com/uc?export=view&id=${id}`;
-            }
-          }
-          return url;
-        } catch {
-          return url;
-        }
-      };
-
-      const logoUrl = logoUrlRaw ? normalizeImageUrl(logoUrlRaw) : "";
-      const bannerUrl = bannerUrlRaw ? normalizeImageUrl(bannerUrlRaw) : "";
-
-      const pickImageMime = (filename, fallback) => {
-        const ext = (path.extname(filename) || "").toLowerCase();
-        if (fallback && fallback.startsWith("image/")) return fallback;
-        switch (ext) {
-          case ".png":
-            return "image/png";
-          case ".jpg":
-          case ".jpeg":
-            return "image/jpeg";
-          case ".gif":
-            return "image/gif";
-          case ".webp":
-            return "image/webp";
-          case ".svg":
-            return "image/svg+xml";
-          default:
-            return fallback && fallback.includes("/") ? fallback : "application/octet-stream";
-        }
-      };
-
-      // Helper: ensure image is a Gmail-friendly format (png/jpg/gif). If not, try converting to PNG.
-      const processInlineImage = async (file, cidDefault, label) => {
-        const filename = file.originalname || label;
-        const detected = pickImageMime(filename, file.mimetype);
-        let content = fs.readFileSync(file.path);
-        let contentType = detected;
-        let outFilename = filename;
-
-        const isSupported = /^image\/(png|jpe?g|gif)$/i.test(detected || "");
-        if (!isSupported) {
-          try {
-            const sharp = (await import("sharp")).default;
-            const pngBuffer = await sharp(content).png().toBuffer();
-            content = pngBuffer;
-            contentType = "image/png";
-            const base = path.basename(filename, path.extname(filename));
-            outFilename = `${base}.png`;
-          } catch (e) {
-            const msg = `Inline image \"${filename}\" has unsupported type (${detected}). Install 'sharp' or upload PNG/JPG/GIF.`;
-            console.warn(msg, e.message);
-            const err = new Error(msg);
-            err.code = "UNSUPPORTED_IMAGE";
-            throw err;
-          }
-        }
-
-        return {
-          filename: outFilename,
-          content,
-          contentType,
-          cid: cidDefault,
-        };
-      };
-
-      if (!logoUrl && req.files.logoFile) {
-        const lf = req.files.logoFile[0];
-        try {
-          attachments.push(await processInlineImage(lf, logoCid, "logo"));
-        } catch (e) {
-          return res.status(400).json({ error: e.code === "UNSUPPORTED_IMAGE" ? e.message : "Could not prepare logo", details: e.message });
-        }
-      }
-      if (!bannerUrl && req.files.bannerFile) {
-        const bf = req.files.bannerFile[0];
-        try {
-          attachments.push(await processInlineImage(bf, bannerCid, "banner"));
-        } catch (e) {
-          return res.status(400).json({ error: e.code === "UNSUPPORTED_IMAGE" ? e.message : "Could not prepare banner", details: e.message });
-        }
-      }
-
-  const results = { sent: 0, failed: 0, failures: [], details: [] };
-
-      // Prepare user-uploaded generic attachments (non-inline)
-      const genericAttachments = (req.files.attachments || []).map((file) => ({
-        filename: file.originalname || "attachment",
-        path: file.path,
-        contentType: file.mimetype,
-      }));
-
-      for (const r of recipients) {
-        const email = r.email || r.Email;
-        const name = r.name || r.Name || "";
-        if (!email) continue;
-
-        // Use the provided HTML as-is (already includes logo/banner from the generator).
-        // Only personalize [Name] placeholders to avoid duplicating images.
-        const personalizedHtml = html.replace(/\[Name\]/g, name);
-
-        try {
-          const attachmentsInline = attachments.map((a) => ({
-            filename: a.filename,
-            content: Buffer.isBuffer(a.content) ? Buffer.from(a.content) : a.content,
-            cid: a.cid,
-            contentType: a.contentType,
-          }));
-          const attachmentsForSend = [...attachmentsInline, ...genericAttachments];
-
-          await bulkTransporter.sendMail({
-            from: `"${fromName}" <${BULK_EMAIL_USER}>`,
-            to: email,
-            subject,
-            html: personalizedHtml,
-            // Do not add inline logo/banner here — the generated HTML already contains them
-            attachments: attachmentsForSend.length ? attachmentsForSend : undefined,
-          });
-          console.log(`✅ Sent to ${email}`);
-          results.sent += 1;
-          results.details.push({ email, status: "sent" });
-        } catch (err) {
-          results.failed += 1;
-          results.failures.push({ email, error: err.message });
-          results.details.push({ email, status: "failed", error: err.message });
-        }
-
-        if (delayMs > 0) await delay(delayMs);
-      }
-
-      // --- Cleanup uploaded files ---
-      Object.values(req.files).forEach((fileArr) =>
-        fileArr.forEach((file) => {
-          try {
-            fs.unlinkSync(file.path);
-          } catch (e) {
-            if (e?.code !== "ENOENT") {
-              console.warn(`Cleanup warning for ${file.path}:`, e.message);
-            }
-          }
-        })
-      );
-
-  res.json({ success: true, summary: results });
-    } catch (err) {
-      console.error("Error in /send-csv:", err);
-      return res.status(500).json({ error: "Internal server error", details: err.message });
-    }
-  }
-);
-
-// =======================================================
-// 🔐 OTP routes (from server.js)
-// =======================================================
+// ---------------- SEND OTP (from mail.js) ----------------
 app.post("/send-otp", async (req, res) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ success: false, message: "Email required" });
@@ -667,9 +407,11 @@ app.post("/send-otp", async (req, res) => {
   const expiresAt = Date.now() + 5 * 60 * 1000; // 5 minutes
   otpStore[email] = { otp, expiresAt };
 
+  console.log(`🔐 OTP for ${email}: ${otp} (expires in 5 minutes)`);
+
   try {
-    await otpTransporter.sendMail({
-      from: `"HYPERLOOP TEAM" <${OTP_EMAIL_USER}>`,
+    await transporter.sendMail({
+      from: `"HYPERLOOP TEAM" <${process.env.EMAIL_USER}>`,
       to: email,
       subject: "✨ Your One-Time Password (OTP) for Login",
       html: `
@@ -694,6 +436,7 @@ app.post("/send-otp", async (req, res) => {
       `,
     });
 
+    // ✅ Store email + timestamp in Firestore if available
     if (db) {
       try {
         await addDoc(collection(db, "sent_mails"), {
@@ -712,6 +455,7 @@ app.post("/send-otp", async (req, res) => {
   }
 });
 
+// ---------------- VERIFY OTP (from mail.js) ----------------
 app.post("/verify-otp", (req, res) => {
   const { email, otp } = req.body;
   if (!email || !otp) return res.status(400).json({ success: false, message: "Missing email or otp" });
@@ -740,19 +484,34 @@ setInterval(() => {
   }
 }, 60 * 1000);
 
-// 🧪 Health route
-app.get("/", (req, res) => res.send("📬 Unified Mail Server Running"));
+// Start server with EADDRINUSE handling (try next ports if needed)
+const initialPort = parseInt(process.env.PORT, 10) || 3000;
+const maxAttempts = 20;
 
-// Start server strictly on port 4000 (to match the frontend expectations)
-const PORT = 4000;
-const server = app.listen(PORT, () => {
-  console.log(`🚀 Final sender running on http://localhost:${PORT}`);
-});
-server.on("error", (err) => {
-  if (err && err.code === "EADDRINUSE") {
-    console.error(`❌ Port ${PORT} is already in use. Please free it or change the frontend/backend port.`);
-  } else {
-    console.error("Server failed to start:", err);
+async function startServer(port, attemptsLeft) {
+  for (let i = 0; i < attemptsLeft; i++) {
+    const tryPort = port + i;
+    try {
+      await new Promise((resolve, reject) => {
+        const srv = app.listen(tryPort, () => {
+          console.log(`🚀 Mail merge server running on http://localhost:${tryPort}`);
+          resolve();
+        });
+        srv.on("error", (err) => reject(err));
+      });
+      return;
+    } catch (err) {
+      if (err && err.code === "EADDRINUSE") {
+        console.warn(`Port ${port + i} in use, trying ${port + i + 1}...`);
+        continue;
+      }
+      console.error("Server failed to start:", err);
+      process.exit(1);
+    }
   }
+
+  console.error(`Failed to bind to a port after ${attemptsLeft} attempts starting at ${port}.`);
   process.exit(1);
-});
+}
+
+startServer(initialPort, maxAttempts);
