@@ -20,7 +20,8 @@
     "firebase": "^12.4.0",
     "multer": "^2.0.2",
     "node-fetch": "^3.3.2",
-    "nodemailer": "^7.0.10"
+    "nodemailer": "^7.0.10",
+    "sharp": "^0.34.4"
   },
   "description": ""
 }
