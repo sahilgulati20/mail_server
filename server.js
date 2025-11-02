@@ -52,38 +52,54 @@ try {
 // ---------------- NODEMAILER SETUP (FLEXIBLE) ----------------
 // Utility function to create a robust transporter configuration
 const createTransporter = (service, user, pass, host, port) => {
-    const isSendGrid = service && service.toLowerCase() === 'sendgrid';
-    const hasExplicitHost = !!host && !!port;
-    
-    // --- SendGrid/Transactional Fix ---
-    // If SendGrid is used, force explicit host and port 2525 to bypass Render firewall blocks (which block 587/465).
-    if (isSendGrid) {
-        return nodemailer.createTransport({
-            host: 'smtp.sendgrid.net',
-            port: 2525, // Common alternative port to bypass blocks
-            secure: false, // Use STARTTLS
-            auth: { user, pass },
-        });
-    }
+  const isSendGrid = service && service.toLowerCase() === "sendgrid";
+  const isGmail = service && service.toLowerCase().includes("gmail");
+  const hasExplicitHost = !!host && !!port;
 
-    // --- Custom Host/Port ---
-    // If explicit host/port are provided (e.g., in .env), use them.
-    if (hasExplicitHost) {
-        const secure = parseInt(port, 10) === 465;
-        return nodemailer.createTransport({
-            host: host,
-            port: parseInt(port, 10),
-            secure: secure,
-            auth: { user, pass },
-        });
-    }
-    
-    // --- Default Service (Gmail, Outlook) ---
-    // Use Nodemailer's built-in service defaults (likely to fail on cloud hosts)
+  // Short‑term fix for Gmail on Render: force 465 + secure + timeout
+  if (!hasExplicitHost && isGmail) {
     return nodemailer.createTransport({
-        service: service,
-        auth: { user, pass },
+      host: "smtp.gmail.com",
+      port: 465,
+      secure: true,
+      auth: { user, pass },
+      connectionTimeout: 10000,
+      pool: true,
     });
+  }
+
+  // SendGrid/Transactional: prefer an alternate port to avoid provider firewalls
+  if (isSendGrid && !hasExplicitHost) {
+    return nodemailer.createTransport({
+      host: "smtp.sendgrid.net",
+      port: 2525,
+      secure: false,
+      auth: { user, pass },
+      connectionTimeout: 10000,
+      pool: true,
+    });
+  }
+
+  // Custom Host/Port provided explicitly
+  if (hasExplicitHost) {
+    const secure = parseInt(port, 10) === 465;
+    return nodemailer.createTransport({
+      host,
+      port: parseInt(port, 10),
+      secure,
+      auth: { user, pass },
+      connectionTimeout: 10000,
+      pool: true,
+    });
+  }
+
+  // Service fallback (other providers)
+  return nodemailer.createTransport({
+    service: service,
+    auth: { user, pass },
+    connectionTimeout: 10000,
+    pool: true,
+  });
 };
 
 const BULK_EMAIL_SERVICE = process.env.BULK_EMAIL_SERVICE || process.env.EMAIL_SERVICE;
