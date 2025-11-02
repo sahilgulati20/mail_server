@@ -740,19 +740,23 @@ setInterval(() => {
   }
 }, 60 * 1000);
 
-// 🧪 Health route
-app.get("/", (req, res) => res.send("📬 Unified Mail Server Running"));
+// 🧪 Health route (Render-friendly)
+app.get('/', (_req, res) => res.status(200).send('OK'));
 
 // Start server strictly on port 4000 (to match the frontend expectations)
-const PORT = 4000;
-const server = app.listen(PORT, () => {
-  console.log(`🚀 Final sender running on http://localhost:${PORT}`);
+// Start server using Render's PORT (required). Fallback to 4000 locally.
+const PORT = parseInt(process.env.PORT, 10) || 4000;
+const HOST = '0.0.0.0';
+const server = app.listen(PORT, HOST, () => {
+  console.log(`🚀 Mail merge server running on http://localhost:${PORT}`);
 });
-server.on("error", (err) => {
-  if (err && err.code === "EADDRINUSE") {
-    console.error(`❌ Port ${PORT} is already in use. Please free it or change the frontend/backend port.`);
+server.on('error', (err) => {
+  if (err && err.code === 'EADDRINUSE') {
+    console.error(`❌ Port ${PORT} is already in use. Free it or set PORT to a different value.`);
   } else {
-    console.error("Server failed to start:", err);
+    console.error('Server failed to start:', err);
   }
   process.exit(1);
 });
+
+// Remove duplicate listener block (consolidated above)
